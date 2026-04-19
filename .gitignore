@@ -3,3 +3,6 @@ __pycache__/
 assets/feishu-codex-bridge/.env
 assets/feishu-codex-bridge/.feishu_session_map.json
 assets/feishu-codex-bridge/.generated_verification_token
+assets/feishu-codex-bridge/data/
+assets/feishu-codex-bridge/run/
+test-feishu-write.txt

@@ -6,6 +6,7 @@
 
 - 使用飞书官方 `lark-oapi` 长连接收消息（WebSocket）。
 - 默认把消息当作 `codex exec` prompt 执行。
+- 内置多模型 API：`OpenAI / Gemini / DeepSeek / Qwen`（可按会话切换后端）。
 - 默认先发送“已收到”状态，再持续编辑同一条消息展示输出。
 - 流式消息默认用 `post + md` 渲染（飞书 Markdown 子集）。
 - 每个会话独立维护工作目录，可 `/setwd`。
@@ -50,6 +51,13 @@ python3 bridge.py
 ## 6. 飞书内可用指令
 
 - `/codex <prompt>`: 执行 `codex exec --json`
+- `/llm <prompt>`: 用当前激活后端执行（`codex` 或云模型）
+- `/backend`: 查看后端状态与当前激活后端
+- `/backend use <codex|openai|gemini|deepseek|qwen>`: 切换当前会话后端
+- `/openai <prompt>`: 直连 OpenAI
+- `/gemini <prompt>`: 直连 Gemini
+- `/deepseek <prompt>`: 直连 DeepSeek
+- `/qwen <prompt>`: 直连 Qwen
 - `/cmd <args>`: 执行受限版 `codex <args>`（支持 `exec/review/apply/resume/fork/features`）
 - `/setwd <path>`: 设置当前会话工作目录
 - `/status`: 查看当前状态
@@ -67,7 +75,7 @@ python3 bridge.py
 - `/stop`: 终止当前任务
 - `/help`: 查看帮助
 
-不带前缀的消息会默认按 `/codex <message>` 处理。
+不带前缀的消息会默认按当前激活后端处理（默认 `codex`）。
 
 ## 7. 说明
 
@@ -78,12 +86,17 @@ python3 bridge.py
 - 消息合并窗口：`MERGE_WINDOW_SEC`（同会话内该时间窗口内的连续消息会合并后再触发一次 Codex，默认 `0.3` 秒）。
 - 本地 Codex 数据目录：`CODEX_HOME`（默认 `~/.codex`，用于读取 `session_index.jsonl` 和历史会话文件）。
 - 会话持久化文件：`SESSION_STATE_FILE`（默认 `.feishu_session_map.json`，用于保存“飞书会话 -> codex_session_id”映射，重启后继续上下文）。
+- 项目记忆目录：`PROJECT_STATE_DIR/memory/<project_slug>/`。桥接会把 `MEMORY.md`、`active-task.json` 和当天 `daily/YYYY-MM-DD.md` 注入到每次请求里。
+- 自动记忆回写：`PROJECT_MEMORY_AUTO_UPDATE=1` 时，每轮完成后会从“用户请求 + 结果首段”提炼一条去重后的短结论追加到 `MEMORY.md`；长度由 `PROJECT_MEMORY_ENTRY_MAX_CHARS` 控制。
+- 记忆注入裁剪：`PROJECT_MEMORY_MAX_CHARS` 控制 `MEMORY.md` 注入上限，`PROJECT_DAILY_TAIL_LINES` 控制当天日志尾部注入行数。
+- 模型后端参数：`DEFAULT_BACKEND`、`LLM_REQUEST_TIMEOUT_SEC`、`LLM_TEMPERATURE`、`LLM_MAX_TOKENS`。
+- 各家模型参数：`OPENAI_*`、`GEMINI_*`、`DEEPSEEK_*`、`QWEN_*`（`*_API_KEY` 为空时对应后端不可用）。
 - `/session use <n|id>` 会优先从历史会话元信息里恢复对应 `cwd`，减少切回旧 session 后上下文和工作目录不一致的问题。
 - 关键安全参数：`REQUIRE_P2P`、`ALLOWED_OPEN_IDS`、`ALLOWED_CHAT_IDS`、`COMMAND_TOKEN`、`ENABLE_RAW_CMD`、`RATE_LIMIT_PER_MINUTE`。
 
 ## 8. 安全建议（推荐）
 
-- `REQUIRE_P2P=1`：仅允许私聊控制，禁用群聊控制。
+- `REQUIRE_P2P=0`：默认允许私聊和群聊控制；如需只允许私聊，改成 `1`。
 - 填写 `ALLOWED_CHAT_IDS` 或 `ALLOWED_OPEN_IDS`：只允许白名单会话/用户。
 - 设置 `COMMAND_TOKEN`：每条指令前带口令，例如 `mytoken /codex 你好`。
 - 保持 `ENABLE_RAW_CMD=0`：禁用 `/cmd` 透传命令。

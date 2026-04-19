@@ -8,6 +8,7 @@ WebSocket long connection and sends replies through Feishu Open API.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
@@ -23,7 +24,7 @@ import urllib.request
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 try:
     from urllib3.exceptions import NotOpenSSLWarning
@@ -37,6 +38,11 @@ from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 
 
 LOG = logging.getLogger("feishu-codex-bridge")
+
+CODEX_LOG_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+"
+    r"(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+\S+:"
+)
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -62,7 +68,38 @@ class Settings:
     codex_bin: str = "codex"
     codex_default_cwd: str = str(Path.home())
     codex_home: str = str(Path.home() / ".codex")
+    codex_sandbox: str = "workspace-write"
+    codex_auto_resume: bool = False
     session_state_file: str = ".feishu_session_map.json"
+    project_state_dir: str = "data"
+    default_backend: str = "codex"
+    llm_request_timeout_sec: int = 60
+    llm_temperature: float = 0.2
+    llm_max_tokens: int = 2048
+    project_memory_max_chars: int = 2400
+    project_daily_tail_lines: int = 24
+    project_memory_auto_update: bool = True
+    project_memory_entry_max_chars: int = 280
+    response_style: str = "brief"
+    assistant_soul: str = "developer_engineer"
+    assistant_agents_file: str = "AGENTS.md"
+    assistant_soul_file: str = "SOUL.md"
+
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "gpt-4.1-mini"
+
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-chat"
+
+    qwen_api_key: str = ""
+    qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    qwen_model: str = "qwen-plus"
+
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_model: str = "gemini-2.0-flash"
 
     stream_chunk_chars: int = 800
     stream_flush_sec: float = 2.0
@@ -76,13 +113,18 @@ class Settings:
     merge_window_sec: float = 0.3
     status_received_text: str = "⏳ 已收到，正在思考..."
     stream_markdown_title: str = ""
-    require_p2p: bool = True
+    require_p2p: bool = False
     allowed_open_ids: Tuple[str, ...] = ()
     allowed_chat_ids: Tuple[str, ...] = ()
+    bot_open_id: str = ""
+    bot_aliases: Tuple[str, ...] = ()
+    group_require_mention: bool = True
     command_token: str = ""
     enable_raw_cmd: bool = False
     rate_limit_per_minute: int = 20
     max_user_text_chars: int = 8000
+    bot_mention_map: Dict[str, str] = field(default_factory=dict)
+    lark_cli_bin: str = "lark-cli"
     send_unauthorized_notice: bool = False
     unauthorized_notice_text: str = "⛔️ 未授权访问"
     rate_limit_notice_text: str = "⏱ 请求过于频繁，请稍后再试"
@@ -100,6 +142,8 @@ class CodexSessionInfo:
 class ChatState:
     workdir: str
     codex_session_id: str = ""
+    project_slug: str = ""
+    active_backend: str = ""
     process: Optional[subprocess.Popen] = None
     worker: Optional[threading.Thread] = None
     merge_target: Optional[FeishuTarget] = None
@@ -120,6 +164,9 @@ class FeishuTarget:
     chat_id: str
     chat_type: str
     sender_open_id: str
+    source_message_id: str = ""
+    bot_mentioned: bool = False
+    mention_aliases: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -129,6 +176,13 @@ class PendingJob:
     argv: List[str]
     prompt_job: bool = False
     prompt_text: str = ""
+
+
+@dataclass(frozen=True)
+class ProjectInfo:
+    slug: str
+    cwd: str
+    aliases: Tuple[str, ...] = ()
 
 
 class FeishuClient:
@@ -213,25 +267,85 @@ class FeishuClient:
         }
         return json.dumps(payload, ensure_ascii=False)
 
+    @staticmethod
+    def _post_content_rich_text(
+        text: str,
+        mention_map: Dict[str, str],
+        *,
+        title: str = "",
+    ) -> str:
+        aliases = [alias for alias in mention_map.keys() if alias.strip()]
+        if not aliases:
+            return FeishuClient._post_content_markdown(title, text)
+
+        pattern = re.compile(
+            "|".join(re.escape("@" + alias) for alias in sorted(aliases, key=len, reverse=True))
+        )
+        rows: List[List[Dict[str, str]]] = []
+        for raw_line in text.splitlines() or [text]:
+            line = raw_line or " "
+            row: List[Dict[str, str]] = []
+            cursor = 0
+            for match in pattern.finditer(line):
+                if match.start() > cursor:
+                    row.append({"tag": "text", "text": line[cursor:match.start()]})
+                alias = match.group()[1:]
+                open_id = mention_map.get(alias, "").strip()
+                if open_id:
+                    row.append({"tag": "at", "user_id": open_id, "user_name": alias})
+                else:
+                    row.append({"tag": "text", "text": match.group()})
+                cursor = match.end()
+            if cursor < len(line):
+                row.append({"tag": "text", "text": line[cursor:]})
+            if not row:
+                row.append({"tag": "text", "text": " "})
+            rows.append(row)
+
+        payload = {
+            "zh_cn": {
+                "title": title,
+                "content": rows,
+            }
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _messages_url(
+        self,
+        receive_id_type: str,
+        *,
+        reply_to_message_id: str = "",
+    ) -> str:
+        if reply_to_message_id.strip():
+            return (
+                "https://open.feishu.cn/open-apis/im/v1/messages/"
+                + urllib.parse.quote(reply_to_message_id.strip(), safe="")
+                + "/reply"
+            )
+        return "https://open.feishu.cn/open-apis/im/v1/messages?" + urllib.parse.urlencode(
+            {"receive_id_type": receive_id_type}
+        )
+
     def send_text(
         self,
         receive_id: str,
         receive_id_type: str,
         text: str,
+        *,
+        reply_to_message_id: str = "",
     ) -> Optional[str]:
         token = self._get_tenant_access_token()
-        url = "https://open.feishu.cn/open-apis/im/v1/messages?" + urllib.parse.urlencode(
-            {"receive_id_type": receive_id_type}
+        url = self._messages_url(
+            receive_id_type,
+            reply_to_message_id=reply_to_message_id,
         )
         headers = {"Authorization": f"Bearer {token}"}
         last_message_id: Optional[str] = None
 
         for chunk in self._chunk_text(text):
-            payload = {
-                "receive_id": receive_id,
-                "msg_type": "text",
-                "content": json.dumps({"text": chunk}, ensure_ascii=False),
-            }
+            payload = {"msg_type": "text", "content": json.dumps({"text": chunk}, ensure_ascii=False)}
+            if not reply_to_message_id.strip():
+                payload["receive_id"] = receive_id
             resp = self._request_json(url, payload, headers=headers, method="POST")
             if resp.get("code") != 0:
                 raise RuntimeError(f"send message failed: {resp}")
@@ -262,20 +376,51 @@ class FeishuClient:
         markdown_text: str,
         *,
         title: str = "",
+        reply_to_message_id: str = "",
     ) -> Optional[str]:
         token = self._get_tenant_access_token()
-        url = "https://open.feishu.cn/open-apis/im/v1/messages?" + urllib.parse.urlencode(
-            {"receive_id_type": receive_id_type}
+        url = self._messages_url(
+            receive_id_type,
+            reply_to_message_id=reply_to_message_id,
         )
         headers = {"Authorization": f"Bearer {token}"}
-        payload = {
-            "receive_id": receive_id,
-            "msg_type": "post",
-            "content": self._post_content_markdown(title, markdown_text),
-        }
+        payload = {"msg_type": "post", "content": self._post_content_markdown(title, markdown_text)}
+        if not reply_to_message_id.strip():
+            payload["receive_id"] = receive_id
         resp = self._request_json(url, payload, headers=headers, method="POST")
         if resp.get("code") != 0:
             raise RuntimeError(f"send markdown failed: {resp}")
+        data = resp.get("data") or {}
+        msg_id = data.get("message_id")
+        if isinstance(msg_id, str) and msg_id:
+            return msg_id
+        return None
+
+    def send_rich_text(
+        self,
+        receive_id: str,
+        receive_id_type: str,
+        text: str,
+        *,
+        mention_map: Dict[str, str],
+        title: str = "",
+        reply_to_message_id: str = "",
+    ) -> Optional[str]:
+        token = self._get_tenant_access_token()
+        url = self._messages_url(
+            receive_id_type,
+            reply_to_message_id=reply_to_message_id,
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "msg_type": "post",
+            "content": self._post_content_rich_text(text, mention_map, title=title),
+        }
+        if not reply_to_message_id.strip():
+            payload["receive_id"] = receive_id
+        resp = self._request_json(url, payload, headers=headers, method="POST")
+        if resp.get("code") != 0:
+            raise RuntimeError(f"send rich text failed: {resp}")
         data = resp.get("data") or {}
         msg_id = data.get("message_id")
         if isinstance(msg_id, str) and msg_id:
@@ -314,6 +459,10 @@ class CodexBridge:
         self._chat_states: Dict[str, ChatState] = {}
         self._persist_lock = threading.Lock()
         self._session_id_store: Dict[str, str] = {}
+        self._workdir_store: Dict[str, str] = {}
+        self._project_store: Dict[str, str] = {}
+        self._mention_map_lock = threading.Lock()
+        self._learned_mention_map: Dict[str, str] = {}
 
         self._seen_lock = threading.Lock()
         self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
@@ -325,6 +474,7 @@ class CodexBridge:
         self._ws_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._load_session_store()
+        self._load_learned_mention_map()
 
     def start(self) -> None:
         event_handler = (
@@ -402,8 +552,419 @@ class CodexBridge:
                 state = ChatState(workdir=self.settings.codex_default_cwd)
                 with self._persist_lock:
                     state.codex_session_id = self._session_id_store.get(session_key, "")
+                    persisted_workdir = self._workdir_store.get(session_key, "")
+                    state.project_slug = self._project_store.get(session_key, "")
+                if persisted_workdir:
+                    p = Path(persisted_workdir).expanduser()
+                    if p.exists() and p.is_dir():
+                        state.workdir = str(p)
+                if not state.project_slug:
+                    state.project_slug = self._infer_project_slug_from_workdir(state.workdir)
                 self._chat_states[session_key] = state
             return state
+
+    def _state_dir_path(self) -> Path:
+        raw = self.settings.project_state_dir.strip()
+        if raw:
+            return Path(raw).expanduser()
+        store_path = self._session_store_path()
+        if store_path is not None:
+            return store_path.parent / "data"
+        return Path("data")
+
+    def _projects_registry_path(self) -> Path:
+        return self._state_dir_path() / "projects.json"
+
+    def _mention_map_path(self) -> Path:
+        return self._state_dir_path() / "mention_map.json"
+
+    def _project_memory_root(self, project_slug: str) -> Path:
+        return self._state_dir_path() / "memory" / project_slug
+
+    def _assistant_soul_path(self) -> Path:
+        raw = self.settings.assistant_soul_file.strip()
+        if raw:
+            return Path(raw).expanduser()
+        return Path("SOUL.md")
+
+    def _assistant_agents_path(self) -> Path:
+        raw = self.settings.assistant_agents_file.strip()
+        if raw:
+            return Path(raw).expanduser()
+        return Path("AGENTS.md")
+
+    def _load_assistant_agents_text(self) -> str:
+        agents_path = self._assistant_agents_path()
+        if agents_path.exists():
+            try:
+                text = agents_path.read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+            except Exception as exc:
+                LOG.warning("load assistant agents failed path=%s err=%s", agents_path, exc)
+        return (
+            "# AGENTS\n"
+            "- 这是一个飞书里的开发工程师 bot。\n"
+            "- 只代表当前 bot 自己，不代表其他 bot。\n"
+            "- 提到其他 bot 名字，不等于它们会说话。\n"
+            "- 只有真实支持的能力才能承诺；没有实现的能力不要脑补。\n"
+            "- 群聊里只回答当前 bot 被明确点名后的问题。"
+        )
+
+    def _load_assistant_soul_text(self) -> str:
+        soul_path = self._assistant_soul_path()
+        if soul_path.exists():
+            try:
+                text = soul_path.read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+            except Exception as exc:
+                LOG.warning("load assistant soul failed path=%s err=%s", soul_path, exc)
+
+        soul_name = self.settings.assistant_soul.strip().lower() or "developer_engineer"
+        if soul_name == "developer_engineer":
+            return (
+                "# SOUL\n"
+                "你是一个在飞书里协作的开发工程师。\n\n"
+                "- 说话像正常工程师，直接、自然、少废话。\n"
+                "- 先回答当前问题，再补充必要原因和状态。\n"
+                "- 不要硬套固定格式。\n"
+                "- 不要虚构多机器人能力，不要说你可以代替别的 bot 发言，除非系统真的支持。\n"
+                "- 不确定就说未确认。\n"
+                "- 默认使用简体中文。"
+            )
+        return (
+            "# SOUL\n"
+            "默认用简体中文回答，保持实用、清晰、不过度铺垫。"
+        )
+
+    def _bridge_capability_facts(self, target_chat_type: str) -> str:
+        if target_chat_type == "group":
+            facts = [
+                "- This bridge only controls the current bot instance.",
+                "- Mentioning other bot names in a reply does not make them speak.",
+                "- Other bots will reply only if they each have their own running bridge and are directly addressed by their own routing rules.",
+                "- Do not say you can speak for other bots, wake them up, or relay on their behalf unless that is actually implemented.",
+            ]
+            if self.settings.group_require_mention:
+                facts.append("- In group chats, this bot should only respond when it is explicitly mentioned.")
+            else:
+                facts.append("- In group chats, this bot may respond without being mentioned.")
+            return "# Capability Facts\n" + "\n".join(facts)
+        return (
+            "# Capability Facts\n"
+            "- In direct chats, answer the user's request directly.\n"
+            "- Do not volunteer group-routing or multi-bot explanations unless the user explicitly asks about them."
+        )
+
+    @staticmethod
+    def _slugify_project_name(value: str) -> str:
+        normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower())
+        normalized = normalized.strip(".-_")
+        return normalized or "default"
+
+    def _infer_project_slug_from_workdir(self, workdir: str) -> str:
+        p = Path(workdir).expanduser()
+        name = p.name.strip() if p.name.strip() else "default"
+        return self._slugify_project_name(name)
+
+    def _load_projects_registry(self) -> Dict[str, ProjectInfo]:
+        path = self._projects_registry_path()
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load project registry failed path=%s err=%s", path, exc)
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        projects: Dict[str, ProjectInfo] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            slug = self._slugify_project_name(key)
+            cwd = str(value.get("cwd", "") or "").strip()
+            if not cwd:
+                continue
+            p = Path(cwd).expanduser()
+            if not p.exists() or not p.is_dir():
+                continue
+            aliases_raw = value.get("aliases", [])
+            aliases: List[str] = []
+            if isinstance(aliases_raw, list):
+                for item in aliases_raw:
+                    if isinstance(item, str) and item.strip():
+                        aliases.append(item.strip())
+            projects[slug] = ProjectInfo(slug=slug, cwd=str(p), aliases=tuple(aliases))
+        return projects
+
+    def _save_projects_registry(self, projects: Dict[str, ProjectInfo]) -> None:
+        path = self._projects_registry_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload: Dict[str, Dict[str, Any]] = {}
+            for slug, info in sorted(projects.items()):
+                payload[slug] = {
+                    "cwd": info.cwd,
+                    "aliases": list(info.aliases),
+                }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        except Exception as exc:
+            LOG.warning("save project registry failed path=%s err=%s", path, exc)
+
+    def _load_learned_mention_map(self) -> None:
+        path = self._mention_map_path()
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOG.warning("load learned mention map failed path=%s err=%s", path, exc)
+            return
+        if not isinstance(raw, dict):
+            return
+        cleaned: Dict[str, str] = {}
+        for key, value in raw.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            alias = key.strip().lstrip("@")
+            open_id = value.strip()
+            if alias and open_id:
+                cleaned[alias] = open_id
+        with self._mention_map_lock:
+            self._learned_mention_map = cleaned
+
+    def _save_learned_mention_map(self) -> None:
+        path = self._mention_map_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._mention_map_lock:
+                payload = dict(sorted(self._learned_mention_map.items()))
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        except Exception as exc:
+            LOG.warning("save learned mention map failed path=%s err=%s", path, exc)
+
+    def _effective_mention_map(self) -> Dict[str, str]:
+        with self._mention_map_lock:
+            learned = dict(self._learned_mention_map)
+        merged = learned
+        merged.update(self.settings.bot_mention_map)
+        return merged
+
+    @staticmethod
+    def _extract_open_id_candidates(payload: object) -> List[Tuple[str, str]]:
+        results: List[Tuple[str, str]] = []
+
+        def walk(node: object) -> None:
+            if isinstance(node, dict):
+                name_candidates = [
+                    node.get("name"),
+                    node.get("display_name"),
+                    node.get("en_name"),
+                    node.get("user_name"),
+                ]
+                open_id_candidates = [
+                    node.get("open_id"),
+                    node.get("openId"),
+                    node.get("user_id"),
+                    node.get("userId"),
+                ]
+                name = next(
+                    (
+                        str(value).strip()
+                        for value in name_candidates
+                        if isinstance(value, str) and value.strip()
+                    ),
+                    "",
+                )
+                open_id = next(
+                    (
+                        str(value).strip()
+                        for value in open_id_candidates
+                        if isinstance(value, str) and value.strip().startswith("ou_")
+                    ),
+                    "",
+                )
+                if name and open_id:
+                    results.append((name, open_id))
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(payload)
+        return results
+
+    def _lookup_open_id_via_lark_cli(self, alias: str) -> str:
+        query = alias.strip().lstrip("@")
+        if not query:
+            return ""
+        cmd = [
+            self.settings.lark_cli_bin,
+            "contact",
+            "+search-user",
+            "--query",
+            query,
+            "--format",
+            "json",
+            "--page-size",
+            "5",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=self.settings.codex_default_cwd,
+                capture_output=True,
+                text=True,
+                timeout=12,
+                check=False,
+            )
+        except FileNotFoundError:
+            return ""
+        except Exception as exc:
+            LOG.warning("lark-cli lookup failed alias=%s err=%s", query, exc)
+            return ""
+
+        stdout = (proc.stdout or "").strip()
+        if not stdout:
+            return ""
+        try:
+            payload = json.loads(stdout)
+        except Exception:
+            LOG.warning("lark-cli lookup returned non-json alias=%s stdout=%s", query, stdout[:300])
+            return ""
+
+        if isinstance(payload, dict) and payload.get("ok") is False:
+            error = payload.get("error")
+            LOG.info("lark-cli lookup skipped alias=%s error=%s", query, error)
+            return ""
+
+        candidates = self._extract_open_id_candidates(payload)
+        if not candidates:
+            return ""
+
+        lowered = query.lower()
+        for name, open_id in candidates:
+            if name.strip().lower() == lowered:
+                return open_id
+        return candidates[0][1]
+
+    def _resolve_mentions_for_text(self, text: str) -> Dict[str, str]:
+        mention_map = self._effective_mention_map()
+        aliases = {
+            match.group(1).strip()
+            for match in re.finditer(r"@([A-Za-z0-9._\- ]+)", text)
+            if match.group(1).strip()
+        }
+        updated = False
+        for alias in sorted(aliases, key=len, reverse=True):
+            if alias in mention_map and mention_map[alias].strip():
+                continue
+            open_id = self._lookup_open_id_via_lark_cli(alias)
+            if not open_id:
+                continue
+            with self._mention_map_lock:
+                if self._learned_mention_map.get(alias) != open_id:
+                    self._learned_mention_map[alias] = open_id
+                    updated = True
+            mention_map[alias] = open_id
+        if updated:
+            self._save_learned_mention_map()
+        return mention_map
+
+    @staticmethod
+    def _rewrite_placeholder_mentions(text: str, aliases: Tuple[str, ...]) -> str:
+        if "@_user_" not in text or not aliases:
+            return text
+        ordered_placeholders: List[str] = []
+        for match in re.finditer(r"@_user_(\d+)", text):
+            token = match.group(0)
+            if token not in ordered_placeholders:
+                ordered_placeholders.append(token)
+        if not ordered_placeholders:
+            return text
+        rewritten = text
+        for idx, token in enumerate(ordered_placeholders):
+            if idx >= len(aliases):
+                break
+            rewritten = rewritten.replace(token, "@" + aliases[idx])
+        return rewritten
+
+    def _learn_mentions_from_message(self, mentions: object) -> None:
+        learned_any = False
+        if not isinstance(mentions, list):
+            return
+        with self._mention_map_lock:
+            for mention in mentions:
+                name = str(getattr(mention, "name", "") or "").strip().lstrip("@")
+                candidates = [
+                    getattr(mention, "key", None),
+                    getattr(mention, "open_id", None),
+                    getattr(getattr(mention, "id", None), "open_id", None),
+                    getattr(getattr(mention, "user_id", None), "open_id", None),
+                ]
+                open_id = ""
+                for candidate in candidates:
+                    if isinstance(candidate, str) and candidate.strip():
+                        open_id = candidate.strip()
+                        break
+                if name and open_id and self._learned_mention_map.get(name) != open_id:
+                    self._learned_mention_map[name] = open_id
+                    learned_any = True
+        if learned_any:
+            self._save_learned_mention_map()
+
+    def _ensure_project_registered(
+        self,
+        project_slug: str,
+        cwd: str,
+        *,
+        aliases: Optional[List[str]] = None,
+    ) -> ProjectInfo:
+        slug = self._slugify_project_name(project_slug)
+        p = Path(cwd).expanduser().resolve()
+        projects = self._load_projects_registry()
+        current = projects.get(slug)
+        alias_values = tuple(
+            item.strip() for item in (aliases or []) if isinstance(item, str) and item.strip()
+        )
+        info = ProjectInfo(slug=slug, cwd=str(p), aliases=alias_values)
+        if current != info:
+            projects[slug] = info
+            self._save_projects_registry(projects)
+        self._ensure_project_files(slug)
+        return info
+
+    def _ensure_project_files(self, project_slug: str) -> None:
+        root = self._project_memory_root(project_slug)
+        daily_dir = root / "daily"
+        root.mkdir(parents=True, exist_ok=True)
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        memory_file = root / "MEMORY.md"
+        if not memory_file.exists():
+            memory_file.write_text(
+                "# Project Memory\n\n- Project-specific decisions, conventions, and lessons.\n",
+                encoding="utf-8",
+            )
+        active_task_file = root / "active-task.json"
+        if not active_task_file.exists():
+            active_task_file.write_text(
+                json.dumps({}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     def _session_store_path(self) -> Optional[Path]:
         raw = self.settings.session_state_file.strip()
@@ -425,16 +986,47 @@ class CodexBridge:
         if not isinstance(data, dict):
             LOG.warning("invalid session map format path=%s", p)
             return
-        cleaned: Dict[str, str] = {}
+        cleaned_session: Dict[str, str] = {}
+        cleaned_workdir: Dict[str, str] = {}
+        cleaned_project: Dict[str, str] = {}
         for k, v in data.items():
-            if isinstance(k, str) and isinstance(v, str):
-                key = k.strip()
+            if not isinstance(k, str):
+                continue
+            key = k.strip()
+            if not key:
+                continue
+            # Backward compatible: {"chat_id":"codex_session_id"}
+            if isinstance(v, str):
                 val = v.strip()
-                if key and val:
-                    cleaned[key] = val
+                if val:
+                    cleaned_session[key] = val
+                continue
+            # New format: {"chat_id":{"codex_session_id":"...","workdir":"..."}}
+            if isinstance(v, dict):
+                sid = str(v.get("codex_session_id", "") or "").strip()
+                wd = str(v.get("workdir", "") or "").strip()
+                project_slug = self._slugify_project_name(
+                    str(v.get("project_slug", "") or "").strip()
+                )
+                if sid:
+                    cleaned_session[key] = sid
+                if wd:
+                    p = Path(wd).expanduser()
+                    if p.exists() and p.is_dir():
+                        cleaned_workdir[key] = str(p)
+                if project_slug and project_slug != "default":
+                    cleaned_project[key] = project_slug
         with self._persist_lock:
-            self._session_id_store = cleaned
-        LOG.info("loaded persisted session map path=%s count=%s", p, len(cleaned))
+            self._session_id_store = cleaned_session
+            self._workdir_store = cleaned_workdir
+            self._project_store = cleaned_project
+        LOG.info(
+            "loaded persisted session map path=%s sessions=%s workdirs=%s projects=%s",
+            p,
+            len(cleaned_session),
+            len(cleaned_workdir),
+            len(cleaned_project),
+        )
 
     def _save_session_store(self) -> None:
         p = self._session_store_path()
@@ -443,7 +1035,24 @@ class CodexBridge:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             with self._persist_lock:
-                payload = dict(self._session_id_store)
+                sid_store = dict(self._session_id_store)
+                wd_store = dict(self._workdir_store)
+                project_store = dict(self._project_store)
+                keys = set(sid_store.keys()) | set(wd_store.keys()) | set(project_store.keys())
+                payload: Dict[str, Dict[str, str]] = {}
+                for key in keys:
+                    item: Dict[str, str] = {}
+                    sid = sid_store.get(key, "").strip()
+                    wd = wd_store.get(key, "").strip()
+                    project_slug = project_store.get(key, "").strip()
+                    if sid:
+                        item["codex_session_id"] = sid
+                    if wd:
+                        item["workdir"] = wd
+                    if project_slug:
+                        item["project_slug"] = project_slug
+                    if item:
+                        payload[key] = item
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_text(
                 json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2),
@@ -468,6 +1077,47 @@ class CodexBridge:
             else:
                 if key in self._session_id_store:
                     del self._session_id_store[key]
+                    changed = True
+                # Keep stored workdir so chat does not fall back to default cwd.
+                if key in self._workdir_store:
+                    changed = True
+        if changed:
+            self._save_session_store()
+
+    def _persist_workdir(self, session_key: str, workdir: str) -> None:
+        key = session_key.strip()
+        if not key:
+            return
+        value = workdir.strip()
+        changed = False
+        with self._persist_lock:
+            old = self._workdir_store.get(key, "")
+            if value:
+                if old != value:
+                    self._workdir_store[key] = value
+                    changed = True
+            else:
+                if key in self._workdir_store:
+                    del self._workdir_store[key]
+                    changed = True
+        if changed:
+            self._save_session_store()
+
+    def _persist_project_binding(self, session_key: str, project_slug: str) -> None:
+        key = session_key.strip()
+        if not key:
+            return
+        value = self._slugify_project_name(project_slug)
+        changed = False
+        with self._persist_lock:
+            old = self._project_store.get(key, "")
+            if value and value != "default":
+                if old != value:
+                    self._project_store[key] = value
+                    changed = True
+            else:
+                if key in self._project_store:
+                    del self._project_store[key]
                     changed = True
         if changed:
             self._save_session_store()
@@ -630,6 +1280,301 @@ class CodexBridge:
         with state.lock:
             state.session_candidates = list(sessions)
 
+    def _today_daily_path(self, project_slug: str) -> Path:
+        return self._project_memory_root(project_slug) / "daily" / f"{dt.date.today().isoformat()}.md"
+
+    def _active_task_path(self, project_slug: str) -> Path:
+        return self._project_memory_root(project_slug) / "active-task.json"
+
+    def _memory_file_path(self, project_slug: str) -> Path:
+        return self._project_memory_root(project_slug) / "MEMORY.md"
+
+    def _read_tail_lines(self, path: Path, limit: int) -> str:
+        if not path.exists():
+            return ""
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception as exc:
+            LOG.warning("read tail lines failed path=%s err=%s", path, exc)
+            return ""
+        if limit <= 0:
+            return ""
+        return "\n".join(lines[-limit:]).strip()
+
+    def _truncate_text(self, text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        suffix = "\n...[truncated]"
+        keep = max(1, limit - len(suffix))
+        return text[:keep].rstrip() + suffix
+
+    @staticmethod
+    def _normalize_memory_line(text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        cleaned = cleaned.lstrip("-*0123456789. ").strip()
+        return cleaned
+
+    def _extract_memory_entry(
+        self,
+        *,
+        user_prompt: str,
+        output_text: str,
+    ) -> str:
+        prompt = self._normalize_memory_line(user_prompt)
+        if not prompt:
+            return ""
+
+        body = output_text.strip()
+        if not body:
+            return ""
+
+        body = re.sub(r"\.\.\.\[truncated\]$", "", body, flags=re.IGNORECASE).strip()
+        lines: List[str] = []
+        for raw_line in body.splitlines():
+            line = self._normalize_memory_line(raw_line)
+            if not line:
+                continue
+            if line in {"[empty]"}:
+                continue
+            if CODEX_LOG_LINE_RE.match(line):
+                continue
+            if line.startswith("[codex exit="):
+                continue
+            lines.append(line)
+            if len(" ".join(lines)) >= self.settings.project_memory_entry_max_chars:
+                break
+
+        summary = " ".join(lines)
+        if not summary:
+            return ""
+
+        summary = self._truncate_text(
+            summary,
+            max(80, self.settings.project_memory_entry_max_chars),
+        ).replace("\n", " ").strip()
+        if not summary:
+            return ""
+
+        if summary.lower().startswith(prompt.lower()):
+            entry = summary
+        else:
+            entry = f"关于“{prompt}”：{summary}"
+        return entry.rstrip(" .")
+
+    def _update_project_memory(
+        self,
+        project_slug: str,
+        *,
+        user_prompt: str,
+        output_text: str,
+    ) -> None:
+        if not self.settings.project_memory_auto_update:
+            return
+        self._ensure_project_files(project_slug)
+        path = self._memory_file_path(project_slug)
+        entry = self._extract_memory_entry(
+            user_prompt=user_prompt,
+            output_text=output_text,
+        )
+        if not entry:
+            return
+        bullet = f"- {entry}"
+        try:
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            normalized_existing = {
+                self._normalize_memory_line(line)
+                for line in existing.splitlines()
+                if line.strip().startswith("-")
+            }
+            if self._normalize_memory_line(bullet) in normalized_existing:
+                return
+
+            text = existing.rstrip()
+            if not text:
+                text = "# Project Memory\n\n- Project-specific decisions, conventions, and lessons."
+            if not text.endswith("\n"):
+                text += "\n"
+            path.write_text(text + bullet + "\n", encoding="utf-8")
+        except Exception as exc:
+            LOG.warning("update project memory failed path=%s err=%s", path, exc)
+
+    def _build_project_memory_prefix(
+        self,
+        state: ChatState,
+        prompt: str,
+        *,
+        chat_type: str = "",
+    ) -> str:
+        project_slug = state.project_slug.strip() or self._infer_project_slug_from_workdir(state.workdir)
+        state.project_slug = project_slug
+        self._ensure_project_registered(project_slug, state.workdir)
+        memory_file = self._memory_file_path(project_slug)
+        daily_file = self._today_daily_path(project_slug)
+        active_task_file = self._active_task_path(project_slug)
+
+        memory_text = self._truncate_text(
+            memory_file.read_text(encoding="utf-8").strip() if memory_file.exists() else "",
+            max(200, self.settings.project_memory_max_chars),
+        )
+        daily_text = self._truncate_text(
+            self._read_tail_lines(daily_file, self.settings.project_daily_tail_lines),
+            max(120, self.settings.project_memory_max_chars // 2),
+        )
+        active_task_text = ""
+        if active_task_file.exists():
+            try:
+                active_raw = json.loads(active_task_file.read_text(encoding="utf-8"))
+                if isinstance(active_raw, dict) and active_raw:
+                    active_task_text = json.dumps(active_raw, ensure_ascii=False, indent=2)
+            except Exception as exc:
+                LOG.warning("load active task failed path=%s err=%s", active_task_file, exc)
+
+        sections = [
+            f"project_slug={project_slug}",
+            f"project_cwd={state.workdir}",
+        ]
+        if memory_text:
+            sections.append("project_memory:\n" + memory_text)
+        if active_task_text:
+            sections.append("active_task:\n" + active_task_text)
+        if daily_text:
+            sections.append("today_log_tail:\n" + daily_text)
+        agents_text = self._load_assistant_agents_text()
+        soul_text = self._load_assistant_soul_text()
+        capability_facts = self._bridge_capability_facts(chat_type)
+        return (
+            "You are working inside a project-aware Feishu bridge. "
+            "Treat the following as the authoritative project context for this chat.\n\n"
+            + "Agent instructions:\n"
+            + agents_text
+            + "\n\n"
+            + "Assistant soul:\n"
+            + soul_text
+            + "\n\n"
+            + capability_facts
+            + "\n\n"
+            + "\n\n".join(sections)
+            + "\n\nUser request:\n"
+            + prompt.strip()
+        )
+
+    def _append_project_daily_log(
+        self,
+        project_slug: str,
+        *,
+        user_prompt: str,
+        output_text: str,
+        workdir: str,
+    ) -> None:
+        self._ensure_project_files(project_slug)
+        path = self._today_daily_path(project_slug)
+        now = dt.datetime.now().strftime("%H:%M")
+        output_preview = self._truncate_text(output_text.strip(), 500)
+        entry = (
+            f"\n## {now} task\n"
+            f"- workdir: {workdir}\n"
+            f"- user_request: {user_prompt.strip()}\n"
+            f"- result: {output_preview or '[empty]'}\n"
+        )
+        try:
+            existing = path.read_text(encoding="utf-8") if path.exists() else ""
+            path.write_text(existing + entry, encoding="utf-8")
+        except Exception as exc:
+            LOG.warning("append daily log failed path=%s err=%s", path, exc)
+
+    def _update_active_task(
+        self,
+        project_slug: str,
+        *,
+        user_prompt: str,
+        output_text: str,
+        workdir: str,
+    ) -> None:
+        self._ensure_project_files(project_slug)
+        path = self._active_task_path(project_slug)
+        payload = {
+            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "workdir": workdir,
+            "last_user_request": user_prompt.strip(),
+            "last_result_preview": self._truncate_text(output_text.strip(), 500),
+        }
+        try:
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            LOG.warning("update active task failed path=%s err=%s", path, exc)
+
+    def _record_project_turn(
+        self,
+        state: ChatState,
+        *,
+        user_prompt: str,
+        output_text: str,
+    ) -> None:
+        project_slug = state.project_slug.strip() or self._infer_project_slug_from_workdir(state.workdir)
+        state.project_slug = project_slug
+        self._append_project_daily_log(
+            project_slug,
+            user_prompt=user_prompt,
+            output_text=output_text,
+            workdir=state.workdir,
+        )
+        self._update_active_task(
+            project_slug,
+            user_prompt=user_prompt,
+            output_text=output_text,
+            workdir=state.workdir,
+        )
+        self._update_project_memory(
+            project_slug,
+            user_prompt=user_prompt,
+            output_text=output_text,
+        )
+
+    def _resolve_project_reference(self, reference: str) -> Optional[ProjectInfo]:
+        needle = reference.strip()
+        if not needle:
+            return None
+        slug = self._slugify_project_name(needle)
+        projects = self._load_projects_registry()
+        if slug in projects:
+            return projects[slug]
+        for info in projects.values():
+            if needle == info.cwd:
+                return info
+            for alias in info.aliases:
+                if needle.strip().lower() == alias.lower():
+                    return info
+        return None
+
+    def _bind_project(self, target: FeishuTarget, info: ProjectInfo) -> None:
+        state = self.get_or_create_chat_state(target.session_key)
+        with state.lock:
+            running = state.process is not None and state.process.poll() is None
+            queued = len(state.pending_jobs)
+            merged = len(state.merge_text_parts)
+            if running or queued > 0 or merged > 0:
+                self._try_send(
+                    target,
+                    "cannot change project while a job is running, queued, or waiting for merge",
+                )
+                return
+            cwd_changed = state.workdir != info.cwd
+            state.project_slug = info.slug
+            state.workdir = info.cwd
+            if cwd_changed:
+                state.codex_session_id = ""
+        self._persist_project_binding(target.session_key, info.slug)
+        self._persist_workdir(target.session_key, info.cwd)
+        if cwd_changed:
+            self._persist_session_binding(target.session_key, "")
+        self._try_send(
+            target,
+            f"project={info.slug}\nworkdir={info.cwd}\ncontext_reset={'yes' if cwd_changed else 'no'}",
+        )
+
     @staticmethod
     def _looks_like_command(text: str) -> bool:
         return text.startswith("/")
@@ -727,6 +1672,224 @@ class CodexBridge:
             return {}
 
     @staticmethod
+    def _normalize_backend_name(name: str) -> Optional[str]:
+        normalized = name.strip().lower()
+        alias_map = {
+            "codex": "codex",
+            "openai": "openai",
+            "gemini": "gemini",
+            "deepseek": "deepseek",
+            "qwen": "qwen",
+        }
+        return alias_map.get(normalized)
+
+    def _configured_backends(self) -> Dict[str, bool]:
+        return {
+            "codex": True,
+            "openai": bool(self.settings.openai_api_key.strip()),
+            "gemini": bool(self.settings.gemini_api_key.strip()),
+            "deepseek": bool(self.settings.deepseek_api_key.strip()),
+            "qwen": bool(self.settings.qwen_api_key.strip()),
+        }
+
+    def _effective_backend(self, state: ChatState) -> str:
+        chosen = state.active_backend.strip() or self.settings.default_backend.strip() or "codex"
+        normalized = self._normalize_backend_name(chosen)
+        return normalized or "codex"
+
+    @staticmethod
+    def _extract_openai_compatible_text(payload: dict) -> str:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        message = first.get("message")
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        chunks.append(text.strip())
+            return "\n".join(chunks).strip()
+        return ""
+
+    @staticmethod
+    def _extract_gemini_text(payload: dict) -> str:
+        candidates = payload.get("candidates")
+        if not isinstance(candidates, list) or not candidates:
+            return ""
+        first = candidates[0]
+        if not isinstance(first, dict):
+            return ""
+        content = first.get("content")
+        if not isinstance(content, dict):
+            return ""
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            return ""
+        chunks: List[str] = []
+        for item in parts:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text.strip())
+        return "\n".join(chunks).strip()
+
+    @staticmethod
+    def _http_json_request(
+        url: str,
+        payload: dict,
+        *,
+        timeout: int,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        data = json.dumps(payload).encode("utf-8")
+        req_headers: Dict[str, str] = {"Content-Type": "application/json; charset=utf-8"}
+        if headers:
+            req_headers.update(headers)
+        req = urllib.request.Request(url=url, data=data, headers=req_headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8")
+                return json.loads(body)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+
+    def _call_openai_compatible(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        prompt: str,
+    ) -> str:
+        endpoint = base_url.rstrip("/") + "/chat/completions"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self.settings.llm_temperature,
+            "max_tokens": self.settings.llm_max_tokens,
+        }
+        resp = self._http_json_request(
+            endpoint,
+            payload,
+            timeout=max(5, self.settings.llm_request_timeout_sec),
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        text = self._extract_openai_compatible_text(resp)
+        if text:
+            return text
+        raise RuntimeError(f"empty model response: {resp}")
+
+    def _call_gemini(self, prompt: str) -> str:
+        endpoint = (
+            self.settings.gemini_base_url.rstrip("/")
+            + "/models/"
+            + self.settings.gemini_model
+            + ":generateContent?key="
+            + urllib.parse.quote(self.settings.gemini_api_key, safe="")
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": self.settings.llm_temperature,
+                "maxOutputTokens": self.settings.llm_max_tokens,
+            },
+        }
+        resp = self._http_json_request(
+            endpoint,
+            payload,
+            timeout=max(5, self.settings.llm_request_timeout_sec),
+        )
+        text = self._extract_gemini_text(resp)
+        if text:
+            return text
+        raise RuntimeError(f"empty model response: {resp}")
+
+    def _execute_model_prompt(
+        self,
+        target: FeishuTarget,
+        backend: str,
+        prompt: str,
+    ) -> None:
+        normalized = self._normalize_backend_name(backend) or ""
+        if normalized not in {"openai", "gemini", "deepseek", "qwen"}:
+            self._try_send(target, f"unsupported backend: {backend}")
+            return
+
+        if not prompt.strip():
+            self._try_send(target, "empty prompt")
+            return
+
+        configured = self._configured_backends()
+        if not configured.get(normalized, False):
+            self._try_send(target, f"{normalized} not configured (missing API key)")
+            return
+
+        state = self.get_or_create_chat_state(target.session_key)
+        if not state.project_slug:
+            info = self._ensure_project_registered(
+                self._infer_project_slug_from_workdir(state.workdir),
+                state.workdir,
+            )
+            state.project_slug = info.slug
+            self._persist_project_binding(target.session_key, info.slug)
+            self._persist_workdir(target.session_key, state.workdir)
+
+        prepared_prompt = self._build_project_memory_prefix(
+            state,
+            prompt,
+            chat_type=target.chat_type,
+        )
+        self._try_send(target, self.settings.status_received_text)
+        try:
+            if normalized == "openai":
+                output = self._call_openai_compatible(
+                    base_url=self.settings.openai_base_url,
+                    api_key=self.settings.openai_api_key,
+                    model=self.settings.openai_model,
+                    prompt=prepared_prompt,
+                )
+            elif normalized == "deepseek":
+                output = self._call_openai_compatible(
+                    base_url=self.settings.deepseek_base_url,
+                    api_key=self.settings.deepseek_api_key,
+                    model=self.settings.deepseek_model,
+                    prompt=prepared_prompt,
+                )
+            elif normalized == "qwen":
+                output = self._call_openai_compatible(
+                    base_url=self.settings.qwen_base_url,
+                    api_key=self.settings.qwen_api_key,
+                    model=self.settings.qwen_model,
+                    prompt=prepared_prompt,
+                )
+            else:
+                output = self._call_gemini(prepared_prompt)
+        except Exception as exc:
+            self._try_send(target, f"{normalized} call failed: {exc}")
+            return
+
+        self._record_project_turn(
+            state,
+            user_prompt=prompt,
+            output_text=output,
+        )
+        self._try_send(target, output)
+
+    @staticmethod
     def _strip_mentions(text: str, mentions: object) -> str:
         out = text
         if isinstance(mentions, list):
@@ -736,6 +1899,19 @@ class CodexBridge:
                     out = out.replace(f"@{name}", "")
         out = re.sub(r"@_user_\\d+", "", out)
         return out.strip()
+
+    @staticmethod
+    def _extract_mention_aliases(mentions: object) -> Tuple[str, ...]:
+        aliases: List[str] = []
+        if not isinstance(mentions, list):
+            return ()
+        for mention in mentions:
+            name = str(getattr(mention, "name", "") or "").strip().lstrip("@")
+            if not name:
+                continue
+            if name not in aliases:
+                aliases.append(name)
+        return tuple(aliases)
 
     @staticmethod
     def _extract_text_from_content(content: object) -> str:
@@ -788,6 +1964,37 @@ class CodexBridge:
             deduped.append(chunk)
         return "\n".join(deduped).strip()
 
+    def _message_mentions_this_bot(self, text: str, mentions: object) -> bool:
+        aliases = {
+            alias.strip().lower()
+            for alias in self.settings.bot_aliases
+            if isinstance(alias, str) and alias.strip()
+        }
+        bot_open_id = self.settings.bot_open_id.strip()
+
+        if isinstance(mentions, list):
+            for mention in mentions:
+                mention_name = str(getattr(mention, "name", "") or "").strip().lower()
+                if mention_name and mention_name in aliases:
+                    return True
+                candidates = [
+                    getattr(mention, "key", None),
+                    getattr(mention, "open_id", None),
+                    getattr(getattr(mention, "id", None), "open_id", None),
+                    getattr(getattr(mention, "user_id", None), "open_id", None),
+                ]
+                if bot_open_id:
+                    for candidate in candidates:
+                        if isinstance(candidate, str) and candidate.strip() == bot_open_id:
+                            return True
+
+        lowered_text = text.strip().lower()
+        if lowered_text and aliases:
+            for alias in aliases:
+                if f"@{alias}" in lowered_text:
+                    return True
+        return False
+
     def _consume_rate_limit(self, sender_key: str) -> bool:
         limit = max(0, self.settings.rate_limit_per_minute)
         if limit <= 0:
@@ -832,6 +2039,13 @@ class CodexBridge:
         ):
             return False, "", "sender_not_allowed"
 
+        if (
+            target.chat_type == "group"
+            and self.settings.group_require_mention
+            and not target.bot_mentioned
+        ):
+            return False, "", "group_not_addressed"
+
         normalized = text.strip()
         token = self.settings.command_token.strip()
         if token:
@@ -849,6 +2063,72 @@ class CodexBridge:
             return False, "", "text_too_long"
 
         return True, normalized, ""
+
+    def _debug_config_text(self, target: FeishuTarget) -> str:
+        state = self.get_or_create_chat_state(target.session_key)
+        with state.lock:
+            active_backend = self._effective_backend(state)
+            project_slug = state.project_slug or self._infer_project_slug_from_workdir(state.workdir)
+            workdir = state.workdir
+            session_id = state.codex_session_id or "(none)"
+        session_store = self._session_store_path()
+        project_root = self._state_dir_path()
+        env_path = Path(".env").resolve()
+        return (
+            f"require_p2p={self.settings.require_p2p}\n"
+            f"allowed_chat_ids={','.join(self.settings.allowed_chat_ids) or '(empty)'}\n"
+            f"allowed_open_ids={','.join(self.settings.allowed_open_ids) or '(empty)'}\n"
+            f"group_require_mention={self.settings.group_require_mention}\n"
+            f"bot_open_id={self.settings.bot_open_id or '(empty)'}\n"
+            f"bot_aliases={','.join(self.settings.bot_aliases) or '(empty)'}\n"
+            f"command_token={'set' if self.settings.command_token else 'empty'}\n"
+            f"enable_raw_cmd={self.settings.enable_raw_cmd}\n"
+            f"rate_limit_per_minute={self.settings.rate_limit_per_minute}\n"
+            f"response_style={self.settings.response_style}\n"
+            f"assistant_soul={self.settings.assistant_soul}\n"
+            f"assistant_agents_file={self._assistant_agents_path()}\n"
+            f"assistant_soul_file={self._assistant_soul_path()}\n"
+            f"bot_mention_map={','.join(sorted(self.settings.bot_mention_map.keys())) or '(empty)'}\n"
+            f"learned_mention_map={','.join(sorted(self._effective_mention_map().keys())) or '(empty)'}\n"
+            f"default_backend={self.settings.default_backend}\n"
+            f"active_backend={active_backend}\n"
+            f"codex_sandbox={self.settings.codex_sandbox}\n"
+            f"codex_auto_resume={self.settings.codex_auto_resume}\n"
+            f"project_slug={project_slug}\n"
+            f"workdir={workdir}\n"
+            f"codex_session_id={session_id}\n"
+            f"env_file={env_path}\n"
+            f"session_state_file={session_store if session_store is not None else '(disabled)'}\n"
+            f"project_state_dir={project_root}\n"
+            f"projects_registry_file={self._projects_registry_path()}"
+        )
+
+    def _debug_auth_text(self, target: FeishuTarget) -> str:
+        require_p2p_ok = (not self.settings.require_p2p) or target.chat_type == "p2p"
+        chat_acl_enabled = bool(self.settings.allowed_chat_ids)
+        sender_acl_enabled = bool(self.settings.allowed_open_ids)
+        chat_allowed = (not chat_acl_enabled) or target.chat_id in self.settings.allowed_chat_ids
+        sender_allowed = (not sender_acl_enabled) or target.sender_open_id in self.settings.allowed_open_ids
+        mention_required = target.chat_type == "group" and self.settings.group_require_mention
+        mention_ok = (not mention_required) or target.bot_mentioned
+        acl_pass = require_p2p_ok and chat_allowed and sender_allowed and mention_ok
+        return (
+            f"chat_id={target.chat_id}\n"
+            f"chat_type={target.chat_type}\n"
+            f"sender_open_id={target.sender_open_id}\n"
+            f"bot_mentioned={target.bot_mentioned}\n"
+            f"require_p2p={self.settings.require_p2p}\n"
+            f"require_p2p_ok={require_p2p_ok}\n"
+            f"chat_acl_enabled={chat_acl_enabled}\n"
+            f"chat_allowed={chat_allowed}\n"
+            f"sender_acl_enabled={sender_acl_enabled}\n"
+            f"sender_allowed={sender_allowed}\n"
+            f"group_require_mention={self.settings.group_require_mention}\n"
+            f"mention_required={mention_required}\n"
+            f"mention_ok={mention_ok}\n"
+            f"command_token_required={'yes' if self.settings.command_token else 'no'}\n"
+            f"acl_pass={acl_pass}"
+        )
 
     def _build_target_from_event(self, data: P2ImMessageReceiveV1) -> Optional[Tuple[FeishuTarget, str, str, str, object]]:
         if not data or not getattr(data, "event", None):
@@ -893,7 +2173,11 @@ class CodexBridge:
             text = str(content.get("text", "") or "").strip()
         else:
             text = self._extract_text_from_content(content)
-        text = self._strip_mentions(text, getattr(message, "mentions", None))
+        mentions = getattr(message, "mentions", None)
+        mention_aliases = self._extract_mention_aliases(mentions)
+        self._learn_mentions_from_message(mentions)
+        bot_mentioned = self._message_mentions_this_bot(text, mentions)
+        text = self._strip_mentions(text, mentions)
         if not text:
             LOG.info(
                 "empty parsed text message_type=%s message_id=%s content_preview=%s",
@@ -911,6 +2195,9 @@ class CodexBridge:
                 chat_id=chat_id,
                 chat_type=chat_type,
                 sender_open_id=sender_open_id,
+                source_message_id=message_id,
+                bot_mentioned=bot_mentioned,
+                mention_aliases=mention_aliases,
             )
         elif open_id:
             target = FeishuTarget(
@@ -920,6 +2207,9 @@ class CodexBridge:
                 chat_id=chat_id,
                 chat_type=chat_type,
                 sender_open_id=sender_open_id,
+                source_message_id=message_id,
+                bot_mentioned=bot_mentioned,
+                mention_aliases=mention_aliases,
             )
         elif chat_id:
             target = FeishuTarget(
@@ -929,6 +2219,9 @@ class CodexBridge:
                 chat_id=chat_id,
                 chat_type=chat_type,
                 sender_open_id=sender_open_id,
+                source_message_id=message_id,
+                bot_mentioned=bot_mentioned,
+                mention_aliases=mention_aliases,
             )
         else:
             return None
@@ -1012,6 +2305,21 @@ class CodexBridge:
             )
             return
 
+        if text == "/debug":
+            self._try_send(
+                target,
+                "usage: /debug [config|auth]",
+            )
+            return
+
+        if text == "/debug config":
+            self._try_send(target, self._debug_config_text(target))
+            return
+
+        if text == "/debug auth":
+            self._try_send(target, self._debug_auth_text(target))
+            return
+
         if text == "/status":
             state = self.get_or_create_chat_state(target.session_key)
             with state.lock:
@@ -1019,18 +2327,60 @@ class CodexBridge:
                 queue_len = len(state.pending_jobs)
                 merge_parts = len(state.merge_text_parts)
                 session_id = state.codex_session_id or "(none)"
+                active_backend = self._effective_backend(state)
+                project_slug = state.project_slug or self._infer_project_slug_from_workdir(state.workdir)
             store_path = self._session_store_path()
             store_value = str(store_path) if store_path is not None else "(disabled)"
             msg = (
+                f"project={project_slug}\n"
                 f"workdir={state.workdir}\n"
                 f"running={'yes' if running else 'no'}\n"
                 f"queued_jobs={queue_len}\n"
                 f"merge_buffer_parts={merge_parts}\n"
+                f"active_backend={active_backend}\n"
                 f"codex_session_id={session_id}\n"
                 f"session_state_file={store_value}\n"
                 f"codex_session_index_file={self._codex_session_index_path()}"
             )
             self._try_send(target, msg)
+            return
+
+        if text == "/backend":
+            state = self.get_or_create_chat_state(target.session_key)
+            with state.lock:
+                active_backend = self._effective_backend(state)
+            configured = self._configured_backends()
+            rows = []
+            for name in ["codex", "openai", "gemini", "deepseek", "qwen"]:
+                marker = " [active]" if name == active_backend else ""
+                if name == "codex":
+                    status = "ready"
+                else:
+                    status = "ready" if configured.get(name, False) else "missing_api_key"
+                rows.append(f"{name}={status}{marker}")
+            self._try_send(
+                target,
+                "backends:\n" + "\n".join(rows) + "\nuse: /backend use <name>",
+            )
+            return
+
+        if text.startswith("/backend "):
+            parts = text.split(maxsplit=2)
+            if len(parts) != 3 or parts[1].strip().lower() != "use":
+                self._try_send(target, "usage: /backend use <codex|openai|gemini|deepseek|qwen>")
+                return
+            backend = self._normalize_backend_name(parts[2]) or ""
+            if not backend:
+                self._try_send(target, "usage: /backend use <codex|openai|gemini|deepseek|qwen>")
+                return
+            configured = self._configured_backends()
+            if backend != "codex" and not configured.get(backend, False):
+                self._try_send(target, f"{backend} not configured (missing API key)")
+                return
+            state = self.get_or_create_chat_state(target.session_key)
+            with state.lock:
+                state.active_backend = backend
+            self._try_send(target, f"active backend set to: {backend}")
             return
 
         if text == "/session":
@@ -1039,6 +2389,17 @@ class CodexBridge:
 
         if text.startswith("/session "):
             self._handle_session_command(target, text)
+            return
+
+        if text == "/project":
+            self._try_send(
+                target,
+                "usage: /project [current|list|use <slug>|new <slug> <cwd>]",
+            )
+            return
+
+        if text.startswith("/project "):
+            self._handle_project_command(target, text)
             return
 
         if text in {"/new", "/reset"}:
@@ -1070,16 +2431,58 @@ class CodexBridge:
             self._start_prompt(target, prompt)
             return
 
-        self._start_prompt(target, text)
+        provider_commands = {
+            "/openai ": "openai",
+            "/gemini ": "gemini",
+            "/deepseek ": "deepseek",
+            "/qwen ": "qwen",
+        }
+        for prefix, backend in provider_commands.items():
+            if text.startswith(prefix):
+                prompt = text[len(prefix) :].strip()
+                self._execute_model_prompt(target, backend, prompt)
+                return
+
+        if text.startswith("/llm "):
+            prompt = text[len("/llm ") :].strip()
+            state = self.get_or_create_chat_state(target.session_key)
+            with state.lock:
+                backend = self._effective_backend(state)
+            if backend == "codex":
+                self._start_prompt(target, prompt)
+            else:
+                self._execute_model_prompt(target, backend, prompt)
+            return
+
+        state = self.get_or_create_chat_state(target.session_key)
+        with state.lock:
+            backend = self._effective_backend(state)
+        if backend == "codex":
+            self._start_prompt(target, text)
+        else:
+            self._execute_model_prompt(target, backend, text)
 
     @staticmethod
     def _help_text() -> str:
         return (
             "Commands:\n"
-            "/codex <prompt>  run prompt (auto-resume same chat context)\n"
+            "/codex <prompt>  run prompt in current workdir\n"
+            "/llm <prompt>    run prompt on active backend\n"
+            "/backend         list backends and current selection\n"
+            "/backend use <name> set active backend\n"
+            "/openai <prompt> call OpenAI directly\n"
+            "/gemini <prompt> call Gemini directly\n"
+            "/deepseek <prompt> call DeepSeek directly\n"
+            "/qwen <prompt>   call Qwen directly\n"
             "/cmd <args>      run raw codex command (may be disabled)\n"
+            "/project current show current project binding\n"
+            "/project list    list known projects\n"
+            "/project use <slug> switch project\n"
+            "/project new <slug> <cwd> register and switch project\n"
             "/setwd <path>    set chat workdir\n"
             "/status          show current status\n"
+            "/debug config    show effective live config\n"
+            "/debug auth      show auth verdict for this chat\n"
             "/session         show recent local codex sessions\n"
             "/session current show current bound codex session id\n"
             "/session list [n] show recent local codex sessions\n"
@@ -1094,7 +2497,7 @@ class CodexBridge:
             "/stop            stop current running codex job\n"
             "/help            show this help\n"
             "\n"
-            "If no prefix is provided, message is treated as /codex prompt."
+            "If no prefix is provided, message is routed to active backend."
         )
 
     def _set_workdir(self, target: FeishuTarget, new_dir: str) -> None:
@@ -1120,6 +2523,13 @@ class CodexBridge:
         new_workdir = str(p)
         old_workdir = state.workdir
         state.workdir = new_workdir
+        project_info = self._ensure_project_registered(
+            self._infer_project_slug_from_workdir(new_workdir),
+            new_workdir,
+        )
+        state.project_slug = project_info.slug
+        self._persist_project_binding(target.session_key, project_info.slug)
+        self._persist_workdir(target.session_key, new_workdir)
         context_cleared = False
         if old_workdir != new_workdir and state.codex_session_id:
             state.codex_session_id = ""
@@ -1127,9 +2537,12 @@ class CodexBridge:
             context_cleared = True
 
         if context_cleared:
-            self._try_send(target, f"workdir updated: {p}\ncontext reset: yes")
+            self._try_send(
+                target,
+                f"workdir updated: {p}\nproject={project_info.slug}\ncontext reset: yes",
+            )
         else:
-            self._try_send(target, f"workdir updated: {p}")
+            self._try_send(target, f"workdir updated: {p}\nproject={project_info.slug}")
 
     def _show_bound_session(self, target: FeishuTarget) -> None:
         state = self.get_or_create_chat_state(target.session_key)
@@ -1174,8 +2587,20 @@ class CodexBridge:
                 return False
             if new_workdir is not None:
                 state.workdir = new_workdir
+                info = self._ensure_project_registered(
+                    self._infer_project_slug_from_workdir(new_workdir),
+                    new_workdir,
+                )
+                state.project_slug = info.slug
             state.codex_session_id = normalized
+            persisted_workdir = state.workdir
         self._persist_session_binding(target.session_key, normalized)
+        self._persist_workdir(target.session_key, persisted_workdir)
+        if new_workdir is not None:
+            self._persist_project_binding(
+                target.session_key,
+                self._infer_project_slug_from_workdir(new_workdir),
+            )
         return True
 
     def _show_session_history(
@@ -1390,6 +2815,80 @@ class CodexBridge:
             "usage: /session [current|list [n]|search <query>|use <id|index>|set <id>|clear|new]",
         )
 
+    def _handle_project_command(self, target: FeishuTarget, text: str) -> None:
+        parts = text.split(maxsplit=3)
+        if len(parts) < 2:
+            self._try_send(
+                target,
+                "usage: /project [current|list|use <slug>|new <slug> <cwd>]",
+            )
+            return
+
+        sub = parts[1].strip().lower()
+        if sub == "current":
+            state = self.get_or_create_chat_state(target.session_key)
+            with state.lock:
+                project_slug = state.project_slug or self._infer_project_slug_from_workdir(state.workdir)
+                cwd = state.workdir
+            self._try_send(
+                target,
+                (
+                    f"project={project_slug}\n"
+                    f"workdir={cwd}\n"
+                    f"memory_file={self._memory_file_path(project_slug)}\n"
+                    f"today_log={self._today_daily_path(project_slug)}\n"
+                    f"active_task={self._active_task_path(project_slug)}"
+                ),
+            )
+            return
+
+        if sub == "list":
+            projects = self._load_projects_registry()
+            state = self.get_or_create_chat_state(target.session_key)
+            with state.lock:
+                current_slug = state.project_slug or self._infer_project_slug_from_workdir(state.workdir)
+            if not projects:
+                self._try_send(target, "no projects registered")
+                return
+            lines = []
+            for slug, info in sorted(projects.items()):
+                marker = " [current]" if slug == current_slug else ""
+                lines.append(f"{slug}{marker} -> {info.cwd}")
+            self._try_send(target, "\n".join(lines))
+            return
+
+        if sub == "use":
+            if len(parts) < 3:
+                self._try_send(target, "usage: /project use <slug>")
+                return
+            info = self._resolve_project_reference(parts[2])
+            if info is None:
+                self._try_send(target, f"project not found: {parts[2].strip()}")
+                return
+            self._bind_project(target, info)
+            return
+
+        if sub == "new":
+            if len(parts) < 4:
+                self._try_send(target, "usage: /project new <slug> <cwd>")
+                return
+            slug = self._slugify_project_name(parts[2])
+            cwd = parts[3].strip()
+            p = Path(cwd).expanduser()
+            if not p.is_absolute():
+                p = (Path(self.settings.codex_default_cwd) / p).resolve()
+            if not p.exists() or not p.is_dir():
+                self._try_send(target, f"invalid directory: {p}")
+                return
+            info = self._ensure_project_registered(slug, str(p))
+            self._bind_project(target, info)
+            return
+
+        self._try_send(
+            target,
+            "usage: /project [current|list|use <slug>|new <slug> <cwd>]",
+        )
+
     def _reset_session(self, target: FeishuTarget) -> None:
         state = self.get_or_create_chat_state(target.session_key)
         should_clear_persisted = False
@@ -1477,6 +2976,14 @@ class CodexBridge:
             return
 
         state = self.get_or_create_chat_state(target.session_key)
+        if not state.project_slug:
+            info = self._ensure_project_registered(
+                self._infer_project_slug_from_workdir(state.workdir),
+                state.workdir,
+            )
+            state.project_slug = info.slug
+            self._persist_project_binding(target.session_key, info.slug)
+            self._persist_workdir(target.session_key, state.workdir)
         # Build argv at execution time so queued prompts can inherit latest context.
         self._spawn_job(
             target,
@@ -1515,10 +3022,22 @@ class CodexBridge:
             self._try_send(target, "blocked flag detected")
             return
 
+        if "-s" not in parts and "--sandbox" not in parts:
+            parts.extend(["-s", self.settings.codex_sandbox])
+
         if parts[0] in {"exec", "review", "resume"} and "--json" not in parts:
             parts.append("--json")
 
         state = self.get_or_create_chat_state(target.session_key)
+        if (
+            parts
+            and parts[0] in {"exec", "review", "resume"}
+            and "-s" not in parts
+            and "--sandbox" not in parts
+        ):
+            parts.insert(1, self.settings.codex_sandbox)
+            parts.insert(1, "-s")
+
         argv = [self.settings.codex_bin] + parts
         self._spawn_job(target, argv, state.workdir)
 
@@ -1527,29 +3046,37 @@ class CodexBridge:
         workdir: str,
         codex_session_id: str,
         prompt: str,
+        state: ChatState,
+        *,
+        chat_type: str = "",
     ) -> List[str]:
-        if codex_session_id:
-            return [
-                self.settings.codex_bin,
-                "exec",
+        prepared_prompt = self._build_project_memory_prefix(
+            state,
+            prompt,
+            chat_type=chat_type,
+        )
+        base_argv = [
+            self.settings.codex_bin,
+            "exec",
+            "-s",
+            self.settings.codex_sandbox,
+            "--json",
+            "--skip-git-repo-check",
+        ]
+        if self.settings.codex_auto_resume and codex_session_id:
+            return base_argv + [
                 "-C",
                 workdir,
                 "resume",
-                "--json",
-                "--skip-git-repo-check",
                 codex_session_id,
                 "--",
-                prompt,
+                prepared_prompt,
             ]
-        return [
-            self.settings.codex_bin,
-            "exec",
-            "--json",
-            "--skip-git-repo-check",
+        return base_argv + [
             "-C",
             workdir,
             "--",
-            prompt,
+            prepared_prompt,
         ]
 
     def _spawn_job(
@@ -1587,6 +3114,8 @@ class CodexBridge:
                             cwd,
                             state.codex_session_id,
                             prompt_text,
+                            state,
+                            chat_type=target.chat_type,
                         )
                         display_argv = exec_argv
                     else:
@@ -1641,7 +3170,7 @@ class CodexBridge:
 
             worker = threading.Thread(
                 target=self._stream_process_output,
-                args=(target, proc, exec_argv, stream_message_id),
+                args=(target, proc, exec_argv, stream_message_id, prompt_text if prompt_job else ""),
                 daemon=True,
             )
             with state.lock:
@@ -1695,6 +3224,10 @@ class CodexBridge:
         try:
             event = json.loads(stripped)
         except json.JSONDecodeError:
+            # `codex exec --json` occasionally emits Rust log lines. They are not
+            # user-facing content and should not be relayed back to Feishu.
+            if CODEX_LOG_LINE_RE.match(stripped):
+                return "", saw_delta, ""
             return stripped + "\n", saw_delta, ""
 
         event_type = event.get("type")
@@ -1742,6 +3275,7 @@ class CodexBridge:
         proc: subprocess.Popen,
         argv: List[str],
         stream_message_id: Optional[str] = None,
+        source_prompt: str = "",
     ) -> None:
         sent_chunks = 0
         sent_chars = 0
@@ -1858,6 +3392,7 @@ class CodexBridge:
 
         buf = ""
         edit_text = ""
+        full_output = ""
         saw_delta = False
         last_flush = time.monotonic()
         last_update = 0.0
@@ -1881,6 +3416,7 @@ class CodexBridge:
                     )
             if not text:
                 continue
+            full_output += text
             just_fallback = False
 
             if use_edit_in_place:
@@ -1990,6 +3526,15 @@ class CodexBridge:
             sent_chunks,
             sent_chars,
         )
+        if source_prompt.strip():
+            final_output = full_output
+            if not final_output.strip():
+                final_output = f"[codex exit={rc}]"
+            self._record_project_turn(
+                state,
+                user_prompt=source_prompt,
+                output_text=final_output,
+            )
 
         next_job: Optional[PendingJob] = None
         remaining_queue = 0
@@ -2019,10 +3564,27 @@ class CodexBridge:
         if not target.receive_id or not text:
             return None
         try:
+            normalized_text = self._rewrite_placeholder_mentions(
+                text,
+                target.mention_aliases,
+            )
+            mention_map = self._resolve_mentions_for_text(normalized_text)
+            if mention_map and any(
+                f"@{alias}" in normalized_text for alias in mention_map.keys()
+            ):
+                return self.feishu.send_rich_text(
+                    target.receive_id,
+                    target.receive_id_type,
+                    normalized_text,
+                    mention_map=mention_map,
+                    title=self.settings.stream_markdown_title,
+                    reply_to_message_id=target.source_message_id,
+                )
             return self.feishu.send_text(
                 target.receive_id,
                 target.receive_id_type,
-                text,
+                normalized_text,
+                reply_to_message_id=target.source_message_id,
             )
         except Exception as exc:
             LOG.error(
@@ -2046,6 +3608,7 @@ class CodexBridge:
                 target.receive_id_type,
                 markdown_text,
                 title=self.settings.stream_markdown_title,
+                reply_to_message_id=target.source_message_id,
             )
         except Exception as exc:
             LOG.error(
@@ -2075,6 +3638,23 @@ def load_settings() -> Settings:
             return default
         return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+    def parse_key_value_map(name: str) -> Dict[str, str]:
+        raw = os.getenv(name, "")
+        if not raw.strip():
+            return {}
+        items = re.split(r"[\n,]+", raw)
+        parsed: Dict[str, str] = {}
+        for item in items:
+            piece = item.strip()
+            if not piece or ":" not in piece:
+                continue
+            key, value = piece.split(":", 1)
+            alias = key.strip().lstrip("@")
+            open_id = value.strip()
+            if alias and open_id:
+                parsed[alias] = open_id
+        return parsed
+
     def required(name: str) -> str:
         value = os.getenv(name, "").strip()
         if not value:
@@ -2093,10 +3673,57 @@ def load_settings() -> Settings:
         codex_bin=os.getenv("CODEX_BIN", "codex"),
         codex_default_cwd=os.getenv("CODEX_DEFAULT_CWD", str(Path.home())),
         codex_home=os.getenv("CODEX_HOME", str(Path.home() / ".codex")),
+        codex_sandbox=os.getenv("CODEX_SANDBOX", "workspace-write").strip()
+        or "workspace-write",
+        codex_auto_resume=parse_bool("CODEX_AUTO_RESUME", False),
         session_state_file=os.getenv(
             "SESSION_STATE_FILE",
             ".feishu_session_map.json",
         ),
+        project_state_dir=os.getenv("PROJECT_STATE_DIR", "data").strip() or "data",
+        default_backend=os.getenv("DEFAULT_BACKEND", "codex").strip().lower() or "codex",
+        llm_request_timeout_sec=int(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "60")),
+        llm_temperature=float(os.getenv("LLM_TEMPERATURE", "0.2")),
+        llm_max_tokens=int(os.getenv("LLM_MAX_TOKENS", "2048")),
+        project_memory_max_chars=int(os.getenv("PROJECT_MEMORY_MAX_CHARS", "2400")),
+        project_daily_tail_lines=int(os.getenv("PROJECT_DAILY_TAIL_LINES", "24")),
+        project_memory_auto_update=parse_bool("PROJECT_MEMORY_AUTO_UPDATE", True),
+        project_memory_entry_max_chars=int(
+            os.getenv("PROJECT_MEMORY_ENTRY_MAX_CHARS", "280")
+        ),
+        response_style=os.getenv("RESPONSE_STYLE", "brief").strip().lower() or "brief",
+        assistant_soul=os.getenv("ASSISTANT_SOUL", "developer_engineer").strip().lower()
+        or "developer_engineer",
+        assistant_agents_file=os.getenv("ASSISTANT_AGENTS_FILE", "AGENTS.md").strip()
+        or "AGENTS.md",
+        assistant_soul_file=os.getenv("ASSISTANT_SOUL_FILE", "SOUL.md").strip()
+        or "SOUL.md",
+        lark_cli_bin=os.getenv("LARK_CLI_BIN", "lark-cli").strip() or "lark-cli",
+        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+        or "https://api.openai.com/v1",
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+        or "gpt-4.1-mini",
+        deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", "").strip(),
+        deepseek_base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").strip()
+        or "https://api.deepseek.com/v1",
+        deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat").strip()
+        or "deepseek-chat",
+        qwen_api_key=os.getenv("QWEN_API_KEY", "").strip(),
+        qwen_base_url=os.getenv(
+            "QWEN_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ).strip()
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        qwen_model=os.getenv("QWEN_MODEL", "qwen-plus").strip() or "qwen-plus",
+        gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
+        gemini_base_url=os.getenv(
+            "GEMINI_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta",
+        ).strip()
+        or "https://generativelanguage.googleapis.com/v1beta",
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+        or "gemini-2.0-flash",
         stream_chunk_chars=int(os.getenv("STREAM_CHUNK_CHARS", "800")),
         stream_flush_sec=float(os.getenv("STREAM_FLUSH_SEC", "2.0")),
         stream_send_interval_sec=float(
@@ -2127,13 +3754,17 @@ def load_settings() -> Settings:
             "STREAM_MARKDOWN_TITLE",
             "",
         ),
-        require_p2p=parse_bool("REQUIRE_P2P", True),
+        require_p2p=parse_bool("REQUIRE_P2P", False),
         allowed_open_ids=parse_csv("ALLOWED_OPEN_IDS"),
         allowed_chat_ids=parse_csv("ALLOWED_CHAT_IDS"),
+        bot_open_id=os.getenv("BOT_OPEN_ID", "").strip(),
+        bot_aliases=parse_csv("BOT_ALIASES"),
+        group_require_mention=parse_bool("GROUP_REQUIRE_MENTION", True),
         command_token=os.getenv("COMMAND_TOKEN", "").strip(),
         enable_raw_cmd=parse_bool("ENABLE_RAW_CMD", False),
         rate_limit_per_minute=int(os.getenv("RATE_LIMIT_PER_MINUTE", "20")),
         max_user_text_chars=int(os.getenv("MAX_USER_TEXT_CHARS", "8000")),
+        bot_mention_map=parse_key_value_map("BOT_MENTION_MAP"),
         send_unauthorized_notice=parse_bool(
             "SEND_UNAUTHORIZED_NOTICE",
             False,
