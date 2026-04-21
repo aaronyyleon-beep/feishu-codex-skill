@@ -1,11 +1,10 @@
-# Codex Bridge Skills
+# Feishu Codex Bridge Skill
 
-Codex bridge repository for building, debugging, and operating chat bots that control a local Codex CLI.
+Codex skill for building, debugging, and operating a Feishu bot that controls a local Codex CLI.
 
-## What This Repository Covers
+## What This Skill Covers
 
 - Feishu long connection setup and event flow
-- WeCom callback setup and encrypted message handling
 - Plain text, post, and forwarded message parsing
 - Streamed replies through in-place Feishu message edits
 - Per-chat session continuity with `session_key -> codex_session_id`
@@ -19,15 +18,11 @@ Codex bridge repository for building, debugging, and operating chat bots that co
 - `SKILL.md`: main skill instructions and trigger description
 - `agents/openai.yaml`: UI metadata for skill pickers
 - `references/bridge-playbook.md`: operational details, commands, config, and troubleshooting
-- `references/wecom-bridge-playbook.md`: WeCom callback bridge playbook
-- `references/openclaw-im-deployment.md`: IM-driven OpenClaw install/binding guidance
-- `assets/feishu-codex-bridge/`: bundled Feishu runnable reference implementation
-- `assets/wecom-codex-bridge/`: bundled WeCom runnable reference implementation
-- `assets/openclaw-installer/`: bundled Python OpenClaw installer and local channel setup wizard
+- `assets/feishu-codex-bridge/`: bundled runnable reference implementation (`bridge.py`, `.env.example`, `README.md`)
 
 ## Install Manually
 
-This repository currently keeps the original installable skill entrypoint as `feishu-codex-bridge`, and also includes a bundled `codex-wecom bridge` reference implementation.
+This repository contains one skill whose internal skill name is `feishu-codex-bridge`.
 
 ```bash
 git clone https://github.com/xllinbupt/feishu-codex-skill.git
@@ -44,11 +39,11 @@ $feishu-codex-bridge Add support for switching a Feishu chat to a saved Codex se
 
 ## Bundled Code
 
-This repository includes runnable reference implementations under:
+This repository also includes a runnable reference implementation under `assets/feishu-codex-bridge/`.
 
-- `assets/feishu-codex-bridge/`: Feishu long-connection bridge
-- `assets/wecom-codex-bridge/`: WeCom callback bridge
-- `assets/openclaw-installer/`: Python OpenClaw installer for macOS, including Codex fallback repair and Feishu/WeCom local config pages
+- `bridge.py`: Feishu long-connection bridge implementation
+- `.env.example`: safe example configuration
+- `README.md`: usage notes for the bridge itself
 
 Sensitive runtime files are intentionally not included, such as `.env`, `.feishu_session_map.json`, or generated tokens.
 
