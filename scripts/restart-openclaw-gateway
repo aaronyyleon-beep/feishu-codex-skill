@@ -1,0 +1,9 @@
+#!/bin/zsh
+set -euo pipefail
+
+SERVICE_NAME="${1:-ai.openclaw.gateway}"
+TARGET="gui/$(id -u)/${SERVICE_NAME}"
+
+echo "Restarting ${TARGET} ..."
+launchctl kickstart -k "${TARGET}"
+echo "Restarted ${TARGET}"

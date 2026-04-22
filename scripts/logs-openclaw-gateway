@@ -1,0 +1,27 @@
+#!/bin/zsh
+set -euo pipefail
+
+SERVICE_NAME="${1:-ai.openclaw.gateway}"
+LINES="${2:-120}"
+
+ERR_LOG="${HOME}/.openclaw/logs/gateway.err.log"
+OUT_LOG="${HOME}/.openclaw/logs/gateway.out.log"
+
+echo "Service: ${SERVICE_NAME}"
+echo
+
+if [[ -f "${ERR_LOG}" ]]; then
+  echo "== stderr (${ERR_LOG}) =="
+  tail -n "${LINES}" "${ERR_LOG}"
+  echo
+else
+  echo "stderr log not found: ${ERR_LOG}"
+  echo
+fi
+
+if [[ -f "${OUT_LOG}" ]]; then
+  echo "== stdout (${OUT_LOG}) =="
+  tail -n "${LINES}" "${OUT_LOG}"
+else
+  echo "stdout log not found: ${OUT_LOG}"
+fi

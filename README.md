@@ -45,6 +45,24 @@ This repository also includes a runnable reference implementation under `assets/
 - `.env.example`: safe example configuration
 - `README.md`: usage notes for the bridge itself
 
+## Host Scripts
+
+This repository also includes a minimal set of host-side scripts for managing the local OpenClaw gateway from your own terminal:
+
+- `scripts/restart-openclaw-gateway`
+- `scripts/status-openclaw-gateway`
+- `scripts/logs-openclaw-gateway`
+
+Examples:
+
+```bash
+./scripts/restart-openclaw-gateway
+./scripts/status-openclaw-gateway
+./scripts/logs-openclaw-gateway
+```
+
+All three default to the launchd service `ai.openclaw.gateway` and accept an optional first argument to override the service name.
+
 Sensitive runtime files are intentionally not included, such as `.env`, `.feishu_session_map.json`, or generated tokens.
 
 ## Notes

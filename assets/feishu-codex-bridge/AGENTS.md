@@ -31,3 +31,16 @@
 - 先回答问题本身，再补必要原因和状态。
 - 不确定就说未确认。
 - 默认使用简体中文。
+
+## OpenClaw Gateway Host Scripts
+
+- 遇到 OpenClaw gateway 的重启、状态查询、日志查看需求时，优先使用宿主脚本，不要优先现场拼 `launchctl`。
+- 默认脚本路径：
+  - `/Users/aaron/Desktop/codex-feishu/scripts/restart-openclaw-gateway`
+  - `/Users/aaron/Desktop/codex-feishu/scripts/status-openclaw-gateway`
+  - `/Users/aaron/Desktop/codex-feishu/scripts/logs-openclaw-gateway`
+- 对应用途：
+  - 重启 gateway：`restart-openclaw-gateway`
+  - 查看 gateway 状态：`status-openclaw-gateway`
+  - 查看 gateway 日志：`logs-openclaw-gateway`
+- 只有在用户明确要求或脚本不适用时，才退回到底层 `launchctl` 命令。
